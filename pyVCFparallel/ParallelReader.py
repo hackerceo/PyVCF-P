@@ -3,9 +3,9 @@ import queue
 import gzip
 import codecs
 import sys
-import re
+import signal
 
-print(__name__+" => "+__file__)
+# print(__name__+" => "+__file__)
 
 
 class Reader(object):
@@ -22,7 +22,7 @@ class Reader(object):
             'strict_whitespace=True' will split records on tabs only (as with VCF
             spec) which allows you to parse files with spaces in the sample names.
         """
-        from parallel_workers import LineWorkerProcess, FileLoaderProcess
+        from pyVCFparallel.ParallelWorkers import LineWorkerProcess, FileLoaderProcess
         self.LineWorkerProcess = LineWorkerProcess
         self.FileLoaderProcess = FileLoaderProcess
         self.running = False
@@ -31,9 +31,10 @@ class Reader(object):
         self.queue_in = None
         self.queue_out = None
 
-        # Define the "done executing" lock
+        # Define the locks
         self.done_lock = mp.Lock()
         self.flush_lock = mp.Lock()
+        self.abort_lock = mp.Lock()
 
 
         # super(Reader, self).__init__() <====== is this neeeded?
@@ -120,15 +121,30 @@ class Reader(object):
                 # the loader process has released the "working" lock
                 # once it is released it means that no more items will
                 # be added to queue_in
-                if self.queue_in.empty() and self.queue_out.empty():
+
+                print(self.queue_in.empty())
+                print(self.queue_out.empty())
+                aborting = False
+                if self.abort_lock.acquire(False):
+                    aborting = True
+                    self.abort_lock.release()
+
+                if (self.queue_in.empty() and self.queue_out.empty()) or aborting:
+                    self.running = False
                     for p in self.line_processes:
                         if p.exitcode == None:
                             print("Shutting down worker...")
                             p.terminate()
                     raise StopIteration
+        except InterruptedError:
+            pass
         return None
 
 
+
+    def _abort_sig_handler(self, signum, frame):
+        self.abort_lock.release()
+#        self.done_lock.release()
 
 
     def run(self, threadCnt, queueSize):
@@ -136,14 +152,17 @@ class Reader(object):
         self.queue_in = mp.Queue(queueSize)
         self.queue_out = mp.Queue(queueSize)
 
-        # Define the "done executing" lock
-        self.done_lock = mp.Lock()
-        self.flush_lock = mp.Lock()
         self.running = True
+
+        # handling for clean abort process
+        self.abort_lock.acquire()
+        signal.signal(signal.SIGINT, self._abort_sig_handler)
+        signal.signal(signal.SIGTERM, self._abort_sig_handler)
 
         # Start filling the input queue
         # process_fill = mp.Process(target=populate_queue, args=(done_lock, queue_in))
-        self.file_process = self.FileLoaderProcess(self.ctxFile["filename"], self.queue_in, self.done_lock)
+        self.file_process = self.FileLoaderProcess(self.ctxFile["filename"], self.queue_in, self.done_lock, self.abort_lock)
+        self.file_process.daemon = True
         self.file_process.start()
 
         # make sure it has control of the finish lock before starting the workers
@@ -156,6 +175,7 @@ class Reader(object):
         # Run worker processes
         for p in self.line_processes:
             print("starting worker...")
+            p.daemon = True
             p.start()
 
         # # Get the results from the output queue

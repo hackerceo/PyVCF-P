@@ -5,9 +5,9 @@ import sys
 
 
 class Parsers(object):
-    '''Parse the metadata in the header of a VCF file.'''
     @staticmethod
     def ParseHeader(fsock=None, filename=None, compressed=None, encoding='ascii'):
+        '''Parse the metadata in the header of a VCF file.'''
         """ Create a new Reader for a VCF file.
 
             You must specify either fsock (stream) or filename.  Gzipped streams
@@ -139,3 +139,180 @@ class Parsers(object):
         # finished parsing the header information
         return file_header_info
 
+    @staticmethod
+    def _parse_sample_format(self, samp_fmt):
+        """ Parse the format of the calls in this _Record """
+        samp_fmt = make_calldata_tuple(samp_fmt.split(':'))
+
+        for fmt in samp_fmt._fields:
+            try:
+                entry_type = self.formats[fmt].type
+                entry_num = self.formats[fmt].num
+            except KeyError:
+                entry_num = None
+                try:
+                    entry_type = RESERVED_FORMAT[fmt]
+                except KeyError:
+                    entry_type = 'String'
+            samp_fmt._types.append(entry_type)
+            samp_fmt._nums.append(entry_num)
+        return samp_fmt
+
+    @staticmethod
+    def _parse_samples(self, samples, samp_fmt, site):
+        '''Parse a sample entry according to the format specified in the FORMAT
+        column.
+        NOTE: this method has a cython equivalent and care must be taken
+        to keep the two methods equivalent
+        '''
+
+        # check whether we already know how to parse this format
+        if samp_fmt not in self._format_cache:
+            self._format_cache[samp_fmt] = self._parse_sample_format(samp_fmt)
+        samp_fmt = self._format_cache[samp_fmt]
+
+        if cparse:
+            return cparse.parse_samples(
+                self.samples, samples, samp_fmt, samp_fmt._types, samp_fmt._nums, site)
+
+        samp_data = []
+        _map = self._map
+
+        nfields = len(samp_fmt._fields)
+
+        for name, sample in itertools.izip(self.samples, samples):
+
+            # parse the data for this sample
+            sampdat = [None] * nfields
+
+            for i, vals in enumerate(sample.split(':')):
+
+                # short circuit the most common
+                if samp_fmt._fields[i] == 'GT':
+                    sampdat[i] = vals
+                    continue
+                # genotype filters are a special case
+                elif samp_fmt._fields[i] == 'FT':
+                    sampdat[i] = self._parse_filter(vals)
+                    continue
+                elif not vals or vals == ".":
+                    sampdat[i] = None
+                    continue
+
+                entry_num = samp_fmt._nums[i]
+                entry_type = samp_fmt._types[i]
+
+                # we don't need to split single entries
+                if entry_num == 1:
+                    if entry_type == 'Integer':
+                        try:
+                            sampdat[i] = int(vals)
+                        except ValueError:
+                            sampdat[i] = float(vals)
+                    elif entry_type == 'Float' or entry_type == 'Numeric':
+                        sampdat[i] = float(vals)
+                    else:
+                        sampdat[i] = vals
+                    continue
+
+                vals = vals.split(',')
+                if entry_type == 'Integer':
+                    try:
+                        sampdat[i] = _map(int, vals)
+                    except ValueError:
+                        sampdat[i] = _map(float, vals)
+                elif entry_type == 'Float' or entry_type == 'Numeric':
+                    sampdat[i] = _map(float, vals)
+                else:
+                    sampdat[i] = vals
+
+            # create a call object
+            call = _Call(site, name, samp_fmt(*sampdat))
+            samp_data.append(call)
+
+        return samp_data
+
+    @staticmethod
+    def _parse_alt(self, str):
+        if self._alt_pattern.search(str) is not None:
+            # Paired breakend
+            items = self._alt_pattern.split(str)
+            remoteCoords = items[1].split(':')
+            chr = remoteCoords[0]
+            if chr[0] == '<':
+                chr = chr[1:-1]
+                withinMainAssembly = False
+            else:
+                withinMainAssembly = True
+            pos = remoteCoords[1]
+            orientation = (str[0] == '[' or str[0] == ']')
+            remoteOrientation = (re.search('\[', str) is not None)
+            if orientation:
+                connectingSequence = items[2]
+            else:
+                connectingSequence = items[0]
+            return _Breakend(chr, pos, orientation, remoteOrientation, connectingSequence, withinMainAssembly)
+        elif str[0] == '.' and len(str) > 1:
+            return _SingleBreakend(True, str[1:])
+        elif str[-1] == '.' and len(str) > 1:
+            return _SingleBreakend(False, str[:-1])
+        elif str[0] == "<" and str[-1] == ">":
+            return _SV(str[1:-1])
+        else:
+            return _Substitution(str)
+
+    @staticmethod
+    def _parse_info(self, info_str):
+        '''Parse the INFO field of a VCF entry into a dictionary of Python
+        types.
+        '''
+        if info_str == '.':
+            return {}
+
+        entries = info_str.split(';')
+        retdict = {}
+
+        for entry in entries:
+            entry = entry.split('=', 1)
+            ID = entry[0]
+            try:
+                entry_type = self.infos[ID].type
+            except KeyError:
+                try:
+                    entry_type = RESERVED_INFO[ID]
+                except KeyError:
+                    if entry[1:]:
+                        entry_type = 'String'
+                    else:
+                        entry_type = 'Flag'
+
+            if entry_type == 'Integer':
+                vals = entry[1].split(',')
+                try:
+                    val = self._map(int, vals)
+                # Allow specified integers to be flexibly parsed as floats.
+                # Handles cases with incorrectly specified header types.
+                except ValueError:
+                    val = self._map(float, vals)
+            elif entry_type == 'Float':
+                vals = entry[1].split(',')
+                val = self._map(float, vals)
+            elif entry_type == 'Flag':
+                val = True
+            elif entry_type in ('String', 'Character'):
+                try:
+                    vals = entry[1].split(',')  # commas are reserved characters indicating multiple values
+                    val = self._map(str, vals)
+                except IndexError:
+                    entry_type = 'Flag'
+                    val = True
+
+            try:
+                if self.infos[ID].num == 1 and entry_type not in ('Flag',):
+                    val = val[0]
+            except KeyError:
+                pass
+
+            retdict[ID] = val
+
+        return retdict
