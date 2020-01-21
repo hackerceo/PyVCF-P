@@ -6,10 +6,35 @@ import sys
 
 class Parsers(object):
     @staticmethod
+    def getInfoDistributions(self):
+        return {
+            "AA": "1",
+            "AC":"A",
+            "AD":"R",
+            "ADF":"R",
+            "ADR":"R",
+            "AF":"A",
+            "AN":"1",
+            "BQ":"1",
+            "CIGAR":"A",
+            "DB":"0",
+            "DP":"1",
+            "END":"1",
+            "H2":"0",
+            "H3":"0",
+            "MQ":"1",
+            "MQ0":"1",
+            "NS":"1",
+            "SB":"4",
+            "SOMATIC":"0",
+            "VALIDATED":"0",
+            "1000G":"0"
+        }
+
+    @staticmethod
     def ParseHeader(fsock=None, filename=None, compressed=None, encoding='ascii'):
         '''Parse the metadata in the header of a VCF file.'''
-        """ Create a new Reader for a VCF file.
-
+        """ 
             You must specify either fsock (stream) or filename.  Gzipped streams
             or files are attempted to be recogized by the file extension, or gzipped
             can be forced with ``compressed=True``
@@ -39,9 +64,11 @@ class Parsers(object):
         # rewind and read from the begining of the file.
         _reader.seek(0)
         file_header_info = {}
+        file_header_lines = []
         _line = _reader.readline().strip()
         while (_line.startswith("#")):
             # header data starts with "#"
+            file_header_lines.append(_line)
             if _line.startswith("##"):
                 if re.match(".*<.*>", _line):
                     #--------------------------------------- Line type A
@@ -130,14 +157,17 @@ class Parsers(object):
                 # the final header line provides a list of sample identifiers
                 file_header_info["SAMPLES"] = {}
                 samples = _line.split()[9::]
+                order_idx = 0
                 for id in samples:
-                    file_header_info["SAMPLES"][id] = {}
+                    file_header_info["SAMPLES"][id] = {"index": order_idx}
+                    order_idx = order_idx + 1
+                columns_names = _line[1::].split()[0:9]
 
             # get next line
             _line = _reader.readline().strip()
 
         # finished parsing the header information
-        return file_header_info
+        return file_header_info, file_header_lines, columns_names
 
     @staticmethod
     def _parse_sample_format(self, samp_fmt):

@@ -4,6 +4,7 @@ import gzip
 import codecs
 import sys
 import signal
+import collections
 
 # print(__name__+" => "+__file__)
 
@@ -22,9 +23,9 @@ class Reader(object):
             'strict_whitespace=True' will split records on tabs only (as with VCF
             spec) which allows you to parse files with spaces in the sample names.
         """
-        from pyVCFparallel.ParallelWorkers import LineWorkerProcess, FileLoaderProcess
+        from pyVCFparallel.ParallelWorkers import LineWorkerProcess, FileChunkLoaderProcess
         self.LineWorkerProcess = LineWorkerProcess
-        self.FileLoaderProcess = FileLoaderProcess
+        self.FileLoaderProcess = FileChunkLoaderProcess
         self.running = False
 
         # Define the processing queues
@@ -64,11 +65,81 @@ class Reader(object):
 
         # parse the header information if we are only passed a filepathname
         if filename:
-            from pyVCFparallel.ParseVcfHeader import Parsers
-            self.ctxFile["headerInfo"] = Parsers.ParseHeader(fsock=self.ctxFile["reader"], compressed=self.ctxFile["compressed"])
+            from pyVCFparallel.Parsers import Parsers
+            self.ctxFile["headerInfo"], self._header_lines, self._column_headers = Parsers.ParseHeader(fsock=self.ctxFile["reader"], compressed=self.ctxFile["compressed"])
 
 
-        # if strict_whitespace:
+            # ___match PyVCF for compatibility____________________________
+            self.metadata = None
+            self.infos = None
+            self.filters = None
+            self.alts = None
+            self.formats = None
+            self.contigs = None
+            self.samples = None
+
+
+            # build the samples list being sure to keep the correct index order
+            self.samples = []
+            self._sample_indexes = {}
+            for sampleID in self.ctxFile["headerInfo"]["SAMPLES"]:
+                self._sample_indexes[sampleID] = self.ctxFile["headerInfo"]["SAMPLES"][sampleID]["index"]
+                self.samples.append(sampleID)
+            del self.ctxFile["headerInfo"]["SAMPLES"]
+
+
+            setup_info = {"infos":{"file":"INFO", "obj":"Info"},
+                          "filters":{"file": "FILTER", "obj": "Filter"},
+                          "alts":{"file":"ALT", "obj":"Alt"},
+                          "contigs":{"file":"contig", "obj":"Contig"},
+                          "formats":{"file":"FORMAT", "obj":"Format"}
+                          }
+
+            for attr in setup_info:
+                if setup_info[attr]["file"] in self.ctxFile["headerInfo"]:
+                    if type(self.ctxFile["headerInfo"][setup_info[attr]["file"]]) == dict:
+                        # extract a collection of attributes used by the records
+                        attr_counts = collections.Counter()
+                        # generate a list of all attributes used by this type of record
+                        for rec_key in self.ctxFile["headerInfo"][setup_info[attr]["file"]]:
+                            attr_counts.update(self.ctxFile["headerInfo"][setup_info[attr]["file"]][rec_key].keys())
+                        generator = collections.namedtuple(setup_info[attr]["obj"], attr_counts.keys())
+                        # create a defaults dict to fall back on
+                        default_data = {}
+                        for name in attr_counts.keys():
+                            default_data[name] = None
+                        # use generator to convert all the records
+                        setup_info[attr]["data"] = collections.OrderedDict()
+                        for rec_key in self.ctxFile["headerInfo"][setup_info[attr]["file"]]:
+                            safe_data = collections.ChainMap(self.ctxFile["headerInfo"][setup_info[attr]["file"]][rec_key], default_data)
+                            setup_info[attr]["data"][rec_key] = generator(**safe_data)
+                        setattr(self, attr, setup_info[attr]["data"])
+                        del setup_info[attr]["data"]
+                        del self.ctxFile["headerInfo"][setup_info[attr]["file"]]
+                    else:
+                        pass # this is where we need to save this to metadata object
+
+            # assume the remaining information is metadata
+            metadata = collections.OrderedDict()
+            source_list = []
+            for rec_key in self.ctxFile["headerInfo"]:
+                if rec_key == "source":
+                    source_list.append(self.ctxFile["headerInfo"][rec_key])
+                else:
+                    metadata[rec_key] = self.ctxFile["headerInfo"][rec_key]
+                metadata["source"] = source_list
+            del self.ctxFile["headerInfo"]
+
+            # _Info = collections.namedtuple('Info', ['id', 'num', 'type', 'desc', 'source', 'version'])
+            # _Filter = collections.namedtuple('Filter', ['id', 'desc'])
+            # _Alt = collections.namedtuple('Alt', ['id', 'desc'])
+            # _Format = collections.namedtuple('Format', ['id', 'num', 'type', 'desc'])
+            # _Contig = collections.namedtuple('Contig', ['id', 'length'])
+
+            _SampleInfo = collections.namedtuple('SampleInfo', ['samples', 'gt_bases', 'gt_types', 'gt_phases'])
+
+
+                # if strict_whitespace:
         #     self.ctxFile._separator = '\t'
         # else:
         #     self.ctxFile._separator = '\t| +'
@@ -81,27 +152,6 @@ class Reader(object):
 
 
 
-#         #: metadata fields from header (string or hash, depending)
-#         self.ctxFile.metadata = None
-#         #: INFO fields from header
-#         self.ctxFile.infos = None
-#         #: FILTER fields from header
-#         self.ctxFile.filters = None
-#         #: ALT fields from header
-#         self.ctxFile.alts = None
-#         #: FORMAT fields from header
-#         self.ctxFile.formats = None
-#         #: contig fields from header
-#         self.ctxFile.contigs = None
-#         self.ctxFile.samples = None
-#         self.ctxFile._sample_indexes = None
-#         self.ctxFile._header_lines = []
-#         self.ctxFile._column_headers = []
-#         self.ctxFile._tabix = None
-#         self.ctxFile._prepend_chr = prepend_chr
-# #        self.ctxFile._parse_metainfo()
-#         self.ctxFile._format_cache = {}
-#         self.ctxFile.encoding = encoding
 
     def __iter__(self):
         return self
@@ -143,7 +193,10 @@ class Reader(object):
 
 
     def _abort_sig_handler(self, signum, frame):
+        print("abort!!!")
         self.abort_lock.release()
+        for worker in self.line_processes:
+            worker.terminate()
 #        self.done_lock.release()
 
 
@@ -171,7 +224,7 @@ class Reader(object):
 
         # Setup a list of processing workers
         #	processes = [mp.Process(target=processing_worker, args=(5, x, queue_in, queue_out, done_lock), daemon=True) for x in range(4)]
-        self.line_processes = [self.LineWorkerProcess(x, self.queue_in, self.queue_out, self.done_lock) for x in range(threadCnt)]
+        self.line_processes = [self.LineWorkerProcess(x, self.queue_in, self.queue_out, self.done_lock, self.ctxFile["headerInfo"]) for x in range(threadCnt)]
         # Run worker processes
         for p in self.line_processes:
             print("starting worker...")
@@ -556,33 +609,3 @@ class Reader(object):
 #             record.samples = samples
 #
 #         return record
-#
-#     def fetch(self, chrom, start=None, end=None):
-#         """ Fetches records from a tabix-indexed VCF file and returns an
-#             iterable of ``_Record`` instances
-#
-#             chrom must be specified.
-#
-#             The start and end coordinates are in the zero-based,
-#             half-open coordinate system, similar to ``_Record.start`` and
-#             ``_Record.end``. The very first base of a chromosome is
-#             index 0, and the the region includes bases up to, but not
-#             including the base at the end coordinate. For example
-#             ``fetch('4', 10, 20)`` would include all variants
-#             overlapping a 10 base pair region from the 11th base of
-#             through the 20th base (which is at index 19) of chromosome
-#             4. It would not include the 21st base (at index 20). See
-#             http://genomewiki.ucsc.edu/index.php/Coordinate_Transforms
-#             for more information on the zero-based, half-open coordinate
-#             system.
-#
-#             If end is omitted, all variants from start until the end of
-#             the chromosome chrom will be included.
-#
-#             If start and end are omitted, all variants on chrom will be
-#             returned.
-#
-#             requires pysam
-#
-#         """
-#         raise Exception('fetch is not yet available')

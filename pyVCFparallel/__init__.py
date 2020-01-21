@@ -7,6 +7,7 @@ Online version of PyVCF-Parallel documentation is available at http://pyvcf-para
 
 
 from pyVCFparallel.ParallelReader import Reader
+from pyVCFparallel.Parsers import Parsers
 #from pyVCFparallel.parser import VCFReader, VCFWriter
 #from pyVCFparallel.parallel_reader import ParallelReader
 #from pyVCFparallel.filters import Base as Filter
