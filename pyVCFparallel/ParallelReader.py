@@ -5,6 +5,8 @@ import codecs
 import sys
 import signal
 import collections
+import re
+import pickle
 
 # print(__name__+" => "+__file__)
 
@@ -23,6 +25,17 @@ class Reader(object):
             'strict_whitespace=True' will split records on tabs only (as with VCF
             spec) which allows you to parse files with spaces in the sample names.
         """
+        self.options = {}
+        self.options["encoding"] = encoding
+        self.options["prepend_chr"] = prepend_chr
+        self.options["alt_pattern"] = re.compile('[\[\]]')
+        if strict_whitespace:
+            self.options["separator"] = '\t'
+        else:
+            self.options["separator"] = '\t| +'
+        self.options["row_pattern"] = re.compile(self.options["separator"])
+
+
         from pyVCFparallel.ParallelWorkers import LineWorkerProcess, FileChunkLoaderProcess
         self.LineWorkerProcess = LineWorkerProcess
         self.FileLoaderProcess = FileChunkLoaderProcess
@@ -63,92 +76,85 @@ class Reader(object):
             if sys.version > '3':
                 self.ctxFile["reader"] = codecs.getreader(encoding)(self.ctxFile["reader"])
 
-        # parse the header information if we are only passed a filepathname
-        if filename:
-            from pyVCFparallel.Parsers import Parsers
-            self.ctxFile["headerInfo"], self._header_lines, self._column_headers = Parsers.ParseHeader(fsock=self.ctxFile["reader"], compressed=self.ctxFile["compressed"])
+        # parse the header information
+        from pyVCFparallel.Parsers import Parsers
+        self.ctxFile["headerInfo"] = Parsers.ParseHeader(fsock=self.ctxFile["reader"], compressed=self.ctxFile["compressed"], encoding=encoding, options=self.options)
+
+        # ___match PyVCF for compatibility____________________________
+        self.metadata = None
+        self.infos = None
+        self.filters = None
+        self.alts = None
+        self.formats = None
+        self.contigs = None
+        self.samples = None
 
 
-            # ___match PyVCF for compatibility____________________________
-            self.metadata = None
-            self.infos = None
-            self.filters = None
-            self.alts = None
-            self.formats = None
-            self.contigs = None
-            self.samples = None
+        # build the samples list being sure to keep the correct index order
+        self.samples = self.ctxFile["headerInfo"]["samples"]
+        self._sample_indexes = self.ctxFile["headerInfo"]["sample_indexes"]
+        del self.ctxFile["headerInfo"]["samples"]
+        del self.ctxFile["headerInfo"]["sample_indexes"]
+        self.options["samples"] = self.samples
+        self.options["_sample_indexes"] = self._sample_indexes
 
+        # deal with columns
+        self._column_headers = self.ctxFile["headerInfo"]["column_names"]
+        self._column_lookup = self.ctxFile["headerInfo"]["column_index"]
+        del self.ctxFile["headerInfo"]["column_names"]
+        del self.ctxFile["headerInfo"]["column_index"]
 
-            # build the samples list being sure to keep the correct index order
-            self.samples = []
-            self._sample_indexes = {}
-            for sampleID in self.ctxFile["headerInfo"]["SAMPLES"]:
-                self._sample_indexes[sampleID] = self.ctxFile["headerInfo"]["SAMPLES"][sampleID]["index"]
-                self.samples.append(sampleID)
-            del self.ctxFile["headerInfo"]["SAMPLES"]
+        setup_info = {"infos":{"file":"INFO", "obj":"Info"},
+                      "filters":{"file": "FILTER", "obj": "Filter"},
+                      "alts":{"file":"ALT", "obj":"Alt"},
+                      "contigs":{"file":"contig", "obj":"Contig"},
+                      "formats":{"file":"FORMAT", "obj":"Format"}
+                      }
 
-
-            setup_info = {"infos":{"file":"INFO", "obj":"Info"},
-                          "filters":{"file": "FILTER", "obj": "Filter"},
-                          "alts":{"file":"ALT", "obj":"Alt"},
-                          "contigs":{"file":"contig", "obj":"Contig"},
-                          "formats":{"file":"FORMAT", "obj":"Format"}
-                          }
-
-            for attr in setup_info:
-                if setup_info[attr]["file"] in self.ctxFile["headerInfo"]:
-                    if type(self.ctxFile["headerInfo"][setup_info[attr]["file"]]) == dict:
-                        # extract a collection of attributes used by the records
-                        attr_counts = collections.Counter()
-                        # generate a list of all attributes used by this type of record
-                        for rec_key in self.ctxFile["headerInfo"][setup_info[attr]["file"]]:
-                            attr_counts.update(self.ctxFile["headerInfo"][setup_info[attr]["file"]][rec_key].keys())
-                        generator = collections.namedtuple(setup_info[attr]["obj"], attr_counts.keys())
-                        # create a defaults dict to fall back on
-                        default_data = {}
-                        for name in attr_counts.keys():
-                            default_data[name] = None
-                        # use generator to convert all the records
-                        setup_info[attr]["data"] = collections.OrderedDict()
-                        for rec_key in self.ctxFile["headerInfo"][setup_info[attr]["file"]]:
-                            safe_data = collections.ChainMap(self.ctxFile["headerInfo"][setup_info[attr]["file"]][rec_key], default_data)
-                            setup_info[attr]["data"][rec_key] = generator(**safe_data)
-                        setattr(self, attr, setup_info[attr]["data"])
-                        del setup_info[attr]["data"]
-                        del self.ctxFile["headerInfo"][setup_info[attr]["file"]]
-                    else:
-                        pass # this is where we need to save this to metadata object
-
-            # assume the remaining information is metadata
-            metadata = collections.OrderedDict()
-            source_list = []
-            for rec_key in self.ctxFile["headerInfo"]:
-                if rec_key == "source":
-                    source_list.append(self.ctxFile["headerInfo"][rec_key])
+        for attr in setup_info:
+            if setup_info[attr]["file"] in self.ctxFile["headerInfo"]:
+                if type(self.ctxFile["headerInfo"][setup_info[attr]["file"]]) == dict:
+                    # extract a collection of attributes used by the records
+                    attr_counts = collections.Counter()
+                    # generate a list of all attributes used by this type of record
+                    for rec_key in self.ctxFile["headerInfo"][setup_info[attr]["file"]]:
+                        attr_counts.update(self.ctxFile["headerInfo"][setup_info[attr]["file"]][rec_key].keys())
+                    generator = collections.namedtuple(setup_info[attr]["obj"], attr_counts.keys())
+                    # create a defaults dict to fall back on
+                    default_data = {}
+                    for name in attr_counts.keys():
+                        default_data[name] = None
+                    # use generator to convert all the records
+                    setup_info[attr]["data"] = collections.OrderedDict()
+                    for rec_key in self.ctxFile["headerInfo"][setup_info[attr]["file"]]:
+                        safe_data = collections.ChainMap(self.ctxFile["headerInfo"][setup_info[attr]["file"]][rec_key], default_data)
+                        setup_info[attr]["data"][rec_key] = generator(**safe_data)
+                    setattr(self, attr, setup_info[attr]["data"])
+                    del setup_info[attr]["data"]
+                    del self.ctxFile["headerInfo"][setup_info[attr]["file"]]
                 else:
-                    metadata[rec_key] = self.ctxFile["headerInfo"][rec_key]
-                metadata["source"] = source_list
-            del self.ctxFile["headerInfo"]
+                    pass # this is where we need to save this to metadata object
 
-            # _Info = collections.namedtuple('Info', ['id', 'num', 'type', 'desc', 'source', 'version'])
-            # _Filter = collections.namedtuple('Filter', ['id', 'desc'])
-            # _Alt = collections.namedtuple('Alt', ['id', 'desc'])
-            # _Format = collections.namedtuple('Format', ['id', 'num', 'type', 'desc'])
-            # _Contig = collections.namedtuple('Contig', ['id', 'length'])
+        # assume the remaining information is metadata
+        self.metadata = collections.OrderedDict()
+        source_list = []
+        for rec_key in self.ctxFile["headerInfo"]:
+            if rec_key == "source":
+                source_list.append(self.ctxFile["headerInfo"][rec_key])
+            else:
+                self.metadata[rec_key] = self.ctxFile["headerInfo"][rec_key]
+            self.metadata["source"] = source_list
+        # del self.ctxFile["headerInfo"]
 
-            _SampleInfo = collections.namedtuple('SampleInfo', ['samples', 'gt_bases', 'gt_types', 'gt_phases'])
+        # _Info = collections.namedtuple('Info', ['id', 'num', 'type', 'desc', 'source', 'version'])
+        # _Filter = collections.namedtuple('Filter', ['id', 'desc'])
+        # _Alt = collections.namedtuple('Alt', ['id', 'desc'])
+        # _Format = collections.namedtuple('Format', ['id', 'num', 'type', 'desc'])
+        # _Contig = collections.namedtuple('Contig', ['id', 'length'])
 
-
-                # if strict_whitespace:
-        #     self.ctxFile._separator = '\t'
-        # else:
-        #     self.ctxFile._separator = '\t| +'
-
-#        self.ctxFile._row_pattern = re.compile(self.ctxFile._separator)
-#        self.ctxFile._alt_pattern = re.compile('[\[\]]')
+        _SampleInfo = collections.namedtuple('SampleInfo', ['samples', 'gt_bases', 'gt_types', 'gt_phases'])
 
 # TODO: THIS NEEDS TO CHANGE!
-#        self.ctxFile.reader = (line.strip() for line in self.ctxFile._reader if line.strip())
 
 
 
@@ -163,7 +169,8 @@ class Reader(object):
         if self.queue_out == None:
             raise Exception('You must start execute ParallelReader.run(...) before you try to read from it!')
         try:
-            record = self.queue_out.get(True, 3)
+            record = self.queue_out.get(True, 10)
+            record = pickle.loads(record)
             return record
         except queue.Empty:
             if self.done_lock.acquire(False):
@@ -224,7 +231,7 @@ class Reader(object):
 
         # Setup a list of processing workers
         #	processes = [mp.Process(target=processing_worker, args=(5, x, queue_in, queue_out, done_lock), daemon=True) for x in range(4)]
-        self.line_processes = [self.LineWorkerProcess(x, self.queue_in, self.queue_out, self.done_lock, self.ctxFile["headerInfo"]) for x in range(threadCnt)]
+        self.line_processes = [self.LineWorkerProcess(x, self.queue_in, self.queue_out, self.done_lock, self.ctxFile, self.options) for x in range(threadCnt)]
         # Run worker processes
         for p in self.line_processes:
             print("starting worker...")

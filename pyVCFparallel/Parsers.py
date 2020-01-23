@@ -32,7 +32,7 @@ class Parsers(object):
         }
 
     @staticmethod
-    def ParseHeader(fsock=None, filename=None, compressed=None, encoding='ascii'):
+    def ParseHeader(fsock=None, filename=None, compressed=None, encoding='ascii', options=None):
         '''Parse the metadata in the header of a VCF file.'''
         """ 
             You must specify either fsock (stream) or filename.  Gzipped streams
@@ -63,13 +63,14 @@ class Parsers(object):
 
         # rewind and read from the begining of the file.
         _reader.seek(0)
+        return_data = {}
+        return_data["header_lines"] = []
         file_header_info = {}
-        file_header_lines = []
         _line = _reader.readline().strip()
         while (_line.startswith("#")):
             # header data starts with "#"
-            file_header_lines.append(_line)
             if _line.startswith("##"):
+                return_data["header_lines"].append(_line)
                 if re.match(".*<.*>", _line):
                     #--------------------------------------- Line type A
                     items = _line.split('=', 1)
@@ -154,20 +155,28 @@ class Parsers(object):
                     for k, v in val.items():
                         file_header_info[key].append(k)
             else:
-                # the final header line provides a list of sample identifiers
-                file_header_info["SAMPLES"] = {}
-                samples = _line.split()[9::]
-                order_idx = 0
-                for id in samples:
-                    file_header_info["SAMPLES"][id] = {"index": order_idx}
-                    order_idx = order_idx + 1
-                columns_names = _line[1::].split()[0:9]
+                # the final header line provides a list of sample identifiers and field identifiers
+                fields = options["row_pattern"].split(_line[1:])
+                fields_cnt = 0
+                fields_map = {"CHROM":None, "POS":None, "ID":None, "REF":None, "ALT":None, "QUAL":None, "FILTER":None, "INFO":None, "FORMAT":None, "END":None}
+                for fieldname in fields:
+                    if fieldname.upper() in fields_map:
+                        fields_map[fieldname.upper()] = fields_cnt
+                        fields_cnt += 1
+                return_data["column_names"] = fields[0:fields_cnt]
+                return_data["column_index"] = fields_map
+
+                # extract the samples list
+                return_data["samples"] = fields[fields_cnt:]
+                return_data["sample_indexes"] = dict([(x, i) for (i, x) in enumerate(return_data["samples"])])
 
             # get next line
             _line = _reader.readline().strip()
 
-        # finished parsing the header information
-        return file_header_info, file_header_lines, columns_names
+        # finished parsing the header information (FILL IN DEFAULTS AND MISSING COMMON DEFINITIONS)
+        return_data["header_data"] = Parsers._inject_common_header_data(file_header_info)
+
+        return return_data
 
     @staticmethod
     def _parse_sample_format(self, samp_fmt):
@@ -187,6 +196,77 @@ class Parsers(object):
             samp_fmt._types.append(entry_type)
             samp_fmt._nums.append(entry_num)
         return samp_fmt
+
+    @staticmethod
+    def _inject_common_header_data(header_tag_array):
+        # ========[ FORMAT ELEMENTS ]===================================================================================
+        if not "FORMAT" in header_tag_array:
+            header_tag_array["FORMAT"] = {}
+        defaults = {
+            "AD": {"Number":"R","Type":"Integer", "Description":"Read depth for each allele"},
+            "ADF": {"Number":"R","Type":"Integer", "Description":"Read depth for each allele on the forward strand"},
+            "ADR": {"Number":"R","Type":"Integer", "Description":"Read depth for each allele on the reverse strand"},
+            "AHAP": {"Number":"1","Type":"Integer", "Description":"Unique identifier of ancestral haplotype"},
+            "CN": {"Number": "1", "Type": "Integer", "Description": "Copy number genotype for imprecise events"},
+            "CNQ": {"Number": "1", "Type": "Float", "Description": "Copy number genotype quality for imprecise events"},
+            "CNL": {"Number": "G", "Type": "Float", "Description": "Copy number genotype likelihood for imprecise events"},
+            "CNP": {"Number": "G", "Type": "Float", "Description": "Copy number posterior probabilities"},
+            "DP": {"Number": "1", "Type": "Integer", "Description": "Read depth"},
+            "EC": {"Number": "A", "Type": "Integer", "Description": "Expected alternate allele counts"},
+            "FT": {"Number": "1", "Type": "String", "Description": "Filter indicating if this genotype was \"\called\""},
+            "GL": {"Number": "G", "Type": "Float", "Description": "Genotype likelihoods"},
+            "GP": {"Number": "G", "Type": "Float", "Description": "Genotype posterior probabilities"},
+            "GQ": {"Number":"1","Type":"Integer", "Description":"Genotype quality"},
+            "GT": {"Number":"1","Type":"String", "Description":"Genotype"},
+            "HAP": {"Number": "1", "Type": "Integer", "Description": "Unique haplotype identifier"},
+            "HQ": {"Number": "2", "Type": "Integer", "Description": "Haplotype quality"},
+            "MQ": {"Number": "1", "Type": "Integer", "Description": "RMS mapping quality"},
+            "NQ": {"Number": "1", "Type": "Integer", "Description": "Phred style probability score that the variant is novel"},
+            "PL": {"Number": "G", "Type": "Integer", "Description": "Phred-scaled genotype likelihoods rounded to the closest integer"},
+            "PQ": {"Number": "1", "Type": "Integer", "Description": "Phasing quality"},
+            "PS": {"Number": "1", "Type": "Integer", "Description": "Phase set"},
+        }
+        for key in header_tag_array["FORMAT"]:
+            if key in defaults:
+                header_tag_array["FORMAT"][key] = {**defaults[key], **header_tag_array["FORMAT"][key]}
+        for key in defaults:
+            if key not in header_tag_array["FORMAT"]:
+                header_tag_array["FORMAT"][key] = defaults[key]
+
+        # ========[ INFO ELEMENTS ]===================================================================================
+        if not "INFO" in header_tag_array:
+            header_tag_array["INFO"] = {}
+        defaults = {
+            "AA": {"Number":"1", "Type":"String", "Description":"Ancestral allele"},
+            "AC": {"Number":"A", "Type":"Integer", "Description":"Allele count in genotypes, for each ALT allele, in the same order as listed"},
+            "AD": {"Number":"R", "Type":"Integer", "Description":"Total read depth for each allele"},
+            "ADF": {"Number":"R", "Type":"Integer", "Description":"Read depth for each allele on the forward strand"},
+            "ADR": {"Number":"R", "Type":"Integer", "Description":"Read depth for each allele on the reverse strand"},
+            "AF": {"Number":"A", "Type":"Float", "Description":"Allele frequency for each ALT allele in the same order as listed (estimated from primary data, not called genotypes)"},
+            "AN": {"Number":"1", "Type":"Integer", "Description":"Total number of alleles in called genotypes"},
+            "BQ": {"Number":"1", "Type":"Float", "Description":"RMS base quality"},
+            "CIGAR": {"Number":"A", "Type":"String", "Description":"Cigar string describing how to align an alternate allele to the reference allele"},
+            "DB": {"Number":"0", "Type":"Flag", "Description":"dbSNP membership"},
+            "DP": {"Number":"1", "Type":"Integer", "Description":"Combined depth across samples"},
+            "END": {"Number":"1", "Type":"Integer", "Description":"End position on CHROM(used with symbolic alleles; see below)"},
+            "H2:": {"Number":"0", "Type":"Flag", "Description":"HapMap2 membership"},
+            "H3:": {"Number":"0", "Type":"Flag", "Description":"HapMap3 membership"},
+            "MQ:": {"Number":"1", "Type":"Float", "Description":"RMS mapping quality"},
+            "MQ0:": {"Number":"1", "Type":"Integer", "Description":"Number of MAPQ == 0 reads"},
+            "NS:": {"Number":"1", "Type":"Integer", "Description":"Number of samples with data"},
+            "SB": {"Number":"4", "Type":"Integer", "Description":"Strand bias"},
+            "SOMATIC": {"Number":"0", "Type":"Flag", "Description":"Somatic mutation (for cancer genomics)"},
+            "VALIDATED": {"Number":"0", "Type":"Flag", "Description":"Validated by follow-up experiment"},
+            "1000G": {"Number":"0", "Type":"Flag", "Description":"1000 Genomes membership"}
+        }
+        for key in header_tag_array["INFO"]:
+            if key in defaults:
+                header_tag_array["INFO"][key] = {**defaults[key], **header_tag_array["INFO"][key]}
+        for key in defaults:
+            if key not in header_tag_array["INFO"]:
+                header_tag_array["INFO"][key] = defaults[key]
+        return header_tag_array
+
 
     @staticmethod
     def _parse_samples(self, samples, samp_fmt, site):

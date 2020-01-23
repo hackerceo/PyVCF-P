@@ -20,6 +20,10 @@ if __name__ != "__mp_main__":
     time_start = time.time()
     time_last_tick = 0
 
+
+# TODO STUFF HERE:
+# handle ##PEDIGREE and ##pedigreeDB
+
     variant_db = {}
 
     for record in reader:
@@ -32,12 +36,12 @@ if __name__ != "__mp_main__":
 #        pp = pprint.PrettyPrinter(indent=4)
 #        pp.pprint(record)
 
-        for key in record["alt"]:
-            idx = record["ref"][0] + ">" + key
-            if idx in variant_db:
-                variant_db[idx] = variant_db[idx] + 1
-            else:
-                variant_db[idx] = 1
+        # for key in record["alt"]:
+        #     idx = record["ref"][0] + ">" + key
+        #     if idx in variant_db:
+        #         variant_db[idx] = variant_db[idx] + 1
+        #     else:
+        #         variant_db[idx] = 1
 
     pp = pprint.PrettyPrinter(indent=4)
     pp.pprint(variant_db)
